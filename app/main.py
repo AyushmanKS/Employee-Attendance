@@ -117,6 +117,17 @@ def history_out(entry: dict) -> dict:
         changes[field] = change
     return {"at": dt_to_ms(entry["at"]), "by": entry["by"], "reason": entry["reason"], "changes": changes}
 
+def employee_out(doc: dict) -> dict:
+    return {
+        "emp_code": doc["emp_code"],
+        "name": doc["name"],
+        "email": doc["email"],
+        "department": doc["department"],
+        "shift_start": doc["shift_start"],
+        "shift_end": doc["shift_end"],
+        "joined_on": doc["joined_on"],
+        "created_at": dt_to_ms(doc.get("created_at")),
+    }
 
 def record_out(doc: dict) -> dict:
     return {
@@ -193,13 +204,12 @@ def health():
 @app.post("/employees", status_code=201)
 def create_employee(body: EmployeeIn):
     doc = body.model_dump()
-    doc["created_at"] = datetime.now()
+    doc["created_at"] = now_utc()
     try:
         db.employees.insert_one(doc)
     except DuplicateKeyError:
         raise HTTPException(409, "emp_code already exists")
-    doc.pop("_id", None)
-    return doc
+    return employee_out(doc)
 
 
 @app.get("/employees")
