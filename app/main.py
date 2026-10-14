@@ -192,11 +192,12 @@ def health():
 
 @app.post("/employees", status_code=201)
 def create_employee(body: EmployeeIn):
-    if db.employees.find_one({"emp_code": body.emp_code}):
-        raise HTTPException(409, "emp_code already exists")
     doc = body.model_dump()
     doc["created_at"] = datetime.now()
-    db.employees.insert_one(doc)
+    try:
+        db.employees.insert_one(doc)
+    except DuplicateKeyError:
+        raise HTTPException(409, "emp_code already exists")
     doc.pop("_id", None)
     return doc
 
