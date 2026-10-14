@@ -19,7 +19,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.exceptions import RequestValidationError
 from pydantic import AfterValidator, BaseModel, Field, model_validator
-from pymongo import MongoClient
+from pymongo import MongoClient, ReturnDocument
 from pymongo.errors import DuplicateKeyError, PyMongoError
 
 
@@ -44,6 +44,7 @@ def create_indexes():
     db.attendance_logs.create_index([("emp_code", 1), ("date", 1)], unique=True)
     db.employees.create_index([("department", 1), ("emp_code", 1)])
     db.attendance_logs.create_index([("date", -1), ("emp_code", 1)])
+    db.attendance_logs.create_index([("emp_code", 1), ("punch_in", -1)])
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -188,6 +189,9 @@ class PunchInIn(BaseModel):
     punched_at: Optional[EpochMillis] = None
     status: PresenceStatus = "PRESENT"
 
+class PunchOutIn(BaseModel):
+    emp_code: str
+    punched_at: Optional[EpochMillis] = None
 
 # --------------------------------------------------------------------------- #
 # Endpoints provided
@@ -255,6 +259,44 @@ def punch_in(body: PunchInIn):
         raise HTTPException(409, "already punched in for this date")
     return record_out(doc)
 
+@app.post("/attendance/punch-out")
+def punch_out(body: PunchOutIn):
+    emp = db.employees.find_one({"emp_code": body.emp_code})
+    if emp is None:
+        raise HTTPException(404, "employee not found")
+    ts = ms_to_dt(body.punched_at) if body.punched_at is not None else now_utc()
+
+    record = db.attendance_logs.find_one(
+        {"emp_code": body.emp_code, "punch_in": {"$lte": ts}},
+        sort=[("punch_in", -1)],
+    )
+    if record is None or record.get("punch_out") is not None:
+        if db.attendance_logs.find_one({"emp_code": body.emp_code, "punch_out": None, "punch_in": {"$gt": ts}}):
+            raise_422(("body", "punched_at"), "punched_at must be after punch_in")
+    if record is None:
+        raise HTTPException(404, "no punch-in found")
+    if record.get("punch_out") is not None:
+        raise HTTPException(409, "already punched out")
+
+    worked = (ts - record["punch_in"]).total_seconds()
+    if worked <= 0 or worked > 24 * 3600:
+        raise_422(("body", "punched_at"), "punched_at must be after punch_in and within 24 hours")
+
+    work_hours = compute_work_hours(record["punch_in"], ts)
+    updates = {
+        "punch_out": ts,
+        "work_hours": work_hours,
+        "overtime_minutes": compute_overtime(ts, shift_end_for(record["date"], emp)),
+        "half_day": work_hours < HALF_DAY_HOURS,
+    }
+    updated = db.attendance_logs.find_one_and_update(
+        {"_id": record["_id"], "punch_out": None},
+        {"$set": updates},
+        return_document=ReturnDocument.AFTER,
+    )
+    if updated is None:
+        raise HTTPException(409, "already punched out")
+    return record_out(updated)
 
 @app.get("/attendance")
 def list_attendance(
