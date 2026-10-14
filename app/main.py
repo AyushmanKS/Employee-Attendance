@@ -55,21 +55,52 @@ app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0", life
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
-def compute_late_minutes(punch_in: datetime, shift_start: str) -> int:
-    h, m = map(int, shift_start.split(":"))
-    start = punch_in.replace(hour=h, minute=m, second=0, microsecond=0)
-    minutes = int((punch_in - start).total_seconds() / 60)
-    return minutes if minutes > 10 else 0
+def ms_to_dt(ms: int) -> datetime:
+    return EPOCH + timedelta(seconds=ms // 1000)
+
+
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc).replace(microsecond=0)
+
+
+def parse_hhmm(s: str) -> time:
+    h, m = s.split(":")
+    return time(int(h), int(m))
+
+
+def is_overnight(emp: dict) -> bool:
+    return parse_hhmm(emp["shift_end"]) <= parse_hhmm(emp["shift_start"])
+
+
+def shift_start_for(punch_in: datetime, emp: dict) -> datetime:
+    local = punch_in.astimezone(IST)
+    day = local.date()
+    if is_overnight(emp) and local.time() < parse_hhmm(emp["shift_end"]):
+        day -= timedelta(days=1)         
+    return datetime.combine(day, parse_hhmm(emp["shift_start"]), tzinfo=IST)
+
+
+def shift_end_for(date_str: str, emp: dict) -> datetime:
+    day = date.fromisoformat(date_str)
+    if is_overnight(emp):
+        day += timedelta(days=1)
+    return datetime.combine(day, parse_hhmm(emp["shift_end"]), tzinfo=IST)
+
+
+def compute_late_minutes(punch_in: datetime, shift_start: datetime) -> int:
+    seconds = (punch_in - shift_start).total_seconds()
+    return int(seconds // 60) if seconds > GRACE_SECONDS else 0
+
+
+def compute_overtime(punch_out: datetime, shift_end: datetime) -> int:
+    minutes = int((punch_out - shift_end).total_seconds() // 60)
+    return minutes if minutes >= MIN_OVERTIME_MINUTES else 0
 
 
 def compute_work_hours(punch_in: datetime, punch_out: datetime) -> float:
-    return round((punch_out - punch_in).total_seconds() / 3600, 2)
-
-
-def compute_overtime(punch_out: datetime, shift_end: str, date_str: str) -> int:
-    h, m = map(int, shift_end.split(":"))
-    end = datetime.fromisoformat(date_str).replace(hour=h, minute=m, tzinfo=IST)
-    return max(0, int((punch_out - end).total_seconds() / 60))
+    seconds = int((punch_out - punch_in).total_seconds())
+    hours = Decimal(seconds) / Decimal(3600)
+    return float(hours.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 
 def dt_to_ms(dt: Optional[datetime]) -> Optional[int]:
     if dt is None:
@@ -159,16 +190,16 @@ def punch_in(body: PunchInIn):
     emp = db.employees.find_one({"emp_code": body.emp_code})
     if emp is None:
         raise HTTPException(404, "employee not found")
-    ts = datetime.fromtimestamp(body.punched_at / 1000) if body.punched_at is not None else datetime.now()
-    d = ts.date().isoformat()
+    ts = ms_to_dt(body.punched_at) if body.punched_at is not None else now_utc()
+    shift_start = shift_start_for(ts, emp)
     doc = {
         "emp_code": body.emp_code,
-        "date": d,
+        "date": shift_start.date().isoformat(),
         "status": body.status,
         "punch_in": ts,
         "punch_out": None,
         "work_hours": None,
-        "late_minutes": compute_late_minutes(ts, emp["shift_start"]),
+        "late_minutes": compute_late_minutes(ts, shift_start),
         "overtime_minutes": 0,
         "half_day": False,
         "history": [],
