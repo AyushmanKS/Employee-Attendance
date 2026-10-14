@@ -213,15 +213,22 @@ def create_employee(body: EmployeeIn):
 
 
 @app.get("/employees")
-def list_employees(department: Optional[str] = None, page: int = 1, page_size: int = 20):
+def list_employees(
+    department: Optional[str] = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+):
     q = {}
-    if department:
+    if department is not None:
         q["department"] = department
-    skip = (page-1) * page_size
-    total = db.employees.count_documents({})
-    items = list(db.employees.find(q, {"_id": 0}).skip(skip).limit(page_size))
-    return {"items": items, "total": total, "page": page, "page_size": page_size}
-
+    total = db.employees.count_documents(q)
+    cursor = (
+        db.employees.find(q)
+        .sort("emp_code", 1)
+        .skip((page - 1) * page_size)
+        .limit(page_size)
+    )
+    return {"items": [employee_out(e) for e in cursor], "total": total, "page": page, "page_size": page_size}
 
 @app.post("/attendance/punch-in", status_code=201)
 def punch_in(body: PunchInIn):
@@ -252,14 +259,17 @@ def punch_in(body: PunchInIn):
 @app.get("/attendance")
 def list_attendance(
     emp_code: Optional[str] = None,
-    date_from: Optional[str] = None,
-    date_to: Optional[str] = None,
-    status: Optional[str] = None,
-    page: int = 1,
-    page_size: int = 20,
+    date_from: Optional[DateStr] = None,
+    date_to: Optional[DateStr] = None,
+    status: Optional[Status] = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
 ):
+    if date_from and date_to and date_from > date_to:
+        raise_422(("query", "date_from"), "date_from must be on or before date_to")
+
     q = {}
-    if emp_code:
+    if emp_code is not None:
         q["emp_code"] = emp_code
     if date_from or date_to:
         q["date"] = {}
@@ -267,13 +277,17 @@ def list_attendance(
             q["date"]["$gte"] = date_from
         if date_to:
             q["date"]["$lte"] = date_to
-    if status:
+    if status is not None:
         q["status"] = status
-    docs = list(db.attendance_logs.find(q))
-    docs.sort(key=lambda d: d["date"], reverse=True)
-    total = len(docs)
-    page_docs = docs[(page - 1) * page_size : page * page_size]
-    return {"items": [record_out(d) for d in page_docs], "total": total, "page": page, "page_size": page_size}
+
+    total = db.attendance_logs.count_documents(q)
+    cursor = (
+        db.attendance_logs.find(q)
+        .sort([("date", -1), ("emp_code", 1)])
+        .skip((page - 1) * page_size)
+        .limit(page_size)
+    )
+    return {"items": [record_out(d) for d in cursor], "total": total, "page": page, "page_size": page_size}
 
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
