@@ -1,0 +1,7 @@
+.env
+.venv/
+__pycache__/
+race_test.py
+.DS_Store
+.env.bak
+PROBLEM_STATEMENT.docx
