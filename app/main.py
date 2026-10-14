@@ -135,18 +135,41 @@ def record_out(doc: dict) -> dict:
 # --------------------------------------------------------------------------- #
 # Models
 # --------------------------------------------------------------------------- #
+HHMM_PATTERN = r"^([01]\d|2[0-3]):[0-5]\d$"
+DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def check_date(v: str) -> str:
+    if not DATE_RE.match(v):
+        raise ValueError("must be YYYY-MM-DD")
+    date.fromisoformat(v)
+    return v
+
+
+def raise_422(loc: tuple, msg: str):
+    raise RequestValidationError([{"loc": loc, "msg": msg, "type": "value_error"}])
+
+
+DateStr = Annotated[str, AfterValidator(check_date)]
+
 EpochMillis = Annotated[int, Field(strict=True, ge=100_000_000_000, le=4_102_444_800_000)]
 PresenceStatus = Literal["PRESENT" , "WFH", "ON_DUTY"]
 Status = Literal["PRESENT", "WFH", "ON_DUTY", "ABSENT", "LEAVE"]
 
 class EmployeeIn(BaseModel):
-    emp_code: str
-    name: str
-    email: str
-    department: str
-    shift_start: str = "09:30"
-    shift_end: str = "18:30"
-    joined_on: str
+    emp_code: str = Field(pattern=r"^EMP\d{4,6}$")
+    name: str = Field(min_length=1, max_length=100)
+    email: str = Field(max_length=120, pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+    department: str = Field(min_length=1, max_length=50)
+    shift_start: str = Field("09:30", pattern=HHMM_PATTERN)
+    shift_end: str = Field("18:30", pattern=HHMM_PATTERN)
+    joined_on: DateStr
+
+    @model_validator(mode="after")
+    def shift_times_differ(self):
+        if self.shift_start == self.shift_end:
+            raise ValueError("shift_start must differ from shift_end")
+        return self
 
 
 class PunchInIn(BaseModel):
