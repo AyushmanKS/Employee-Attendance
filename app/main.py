@@ -183,6 +183,10 @@ class PunchInIn(BaseModel):
 # --------------------------------------------------------------------------- #
 @app.get("/health")
 def health():
+    try:
+        client.admin.command("ping")
+    except PyMongoError:
+        raise HTTPException(503, "database unavailable")
     return {"status": "ok"}
 
 
