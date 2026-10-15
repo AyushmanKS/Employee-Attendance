@@ -11,6 +11,7 @@ openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 import os
 import re
 import calendar
+import json
 from contextlib import asynccontextmanager
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
@@ -22,6 +23,7 @@ from fastapi.exceptions import RequestValidationError
 from pydantic import AfterValidator, BaseModel, Field, model_validator
 from pymongo import MongoClient, ReturnDocument
 from pymongo.errors import DuplicateKeyError, PyMongoError
+from bson import json_util
 
 
 load_dotenv()
@@ -530,18 +532,12 @@ def regularize(emp_code: str, date: DateStr, body: RegularizeIn):
         raise HTTPException(409, "record was changed by another request; retry")
     return record_out(updated)
 
-@app.get("/attendance")
-def list_attendance(
-    emp_code: Optional[str] = None,
-    date_from: Optional[DateStr] = None,
-    date_to: Optional[DateStr] = None,
-    status: Optional[Status] = None,
-    page: int = Query(1, ge=1),
-    page_size: int = Query(20, ge=1, le=100),
-):
+ATTENDANCE_SORT = [("date", -1), ("emp_code", 1)]
+
+def attendance_list_query(emp_code: Optional[str], date_from: Optional[str],
+                          date_to: Optional[str], status: Optional[str]) -> dict:
     if date_from and date_to and date_from > date_to:
         raise_422(("query", "date_from"), "date_from must be on or before date_to")
-
     q = {}
     if emp_code is not None:
         q["emp_code"] = emp_code
@@ -553,7 +549,18 @@ def list_attendance(
             q["date"]["$lte"] = date_to
     if status is not None:
         q["status"] = status
+    return q
 
+@app.get("/attendance")
+def list_attendance(
+    emp_code: Optional[str] = None,
+    date_from: Optional[DateStr] = None,
+    date_to: Optional[DateStr] = None,
+    status: Optional[Status] = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+):
+    q = attendance_list_query(emp_code, date_from, date_to, status)
     total = db.attendance_logs.count_documents(q)
     cursor = (
         db.attendance_logs.find(q)
@@ -607,27 +614,81 @@ def late_leaderboard(
     items = list(db.attendance_logs.aggregate(late_leaderboard_pipeline(month, limit, department)))
     return {"month": month, "items": items}
 
-@app.get("/analytics/departments/{department}/trend")
-def department_trend(department: str, from_: Annotated[DateStr, Query(alias="from")], to: DateStr):
+def trend_range(from_: str, to: str) -> tuple[date, date]:
     if to < from_:
         raise_422(("query", "to"), "to must be on or after from")
     start, end = date.fromisoformat(from_), date.fromisoformat(to)
     if (end - start).days + 1 > TREND_MAX_DAYS:
         raise_422(("query", "to"), f"range exceeds {TREND_MAX_DAYS} days")
+    return start, end
 
+
+def department_employees(department: str) -> list:
     emps = list(db.employees.find({"department": department}, {"_id": 0, "emp_code": 1, "joined_on": 1}))
     if not emps:
         raise HTTPException(404, "unknown department")
+    return emps
+
+@app.get("/analytics/departments/{department}/trend")
+def department_trend(department: str, from_: Annotated[DateStr, Query(alias="from")], to: DateStr):
+    start, end = trend_range(from_, to)
+    emps = department_employees(department)
     items = list(db.attendance_logs.aggregate(department_trend_pipeline(emps, start, end)))
     return {"department": department, "items": items}
 
+
 # --------------------------------------------------------------------------- #
-# TODO - the rest of the contract (see openapi.yaml):
-#   POST  /attendance/punch-out
-#   PATCH /attendance/{emp_code}/{date}
-#   GET   /analytics/employees/{emp_code}/monthly
-#   GET   /analytics/departments/summary
-#   GET   /analytics/leaderboard/late
-#   GET   /analytics/departments/{department}/trend
-#   GET   /admin/explain/{endpoint}
+# Admin
 # --------------------------------------------------------------------------- #
+ExplainTarget = Literal["attendance_list", "employee_monthly", "department_summary", "late_leaderboard", "department_trend"]
+
+
+def require(name: str, value):
+    """422 for a parameter the explained endpoint needs but the request omitted."""
+    if value is None:
+        raise_422(("query", name), "field required")
+    return value
+
+
+@app.get("/admin/explain/{endpoint}")
+def explain(
+    endpoint: ExplainTarget,
+    emp_code: Optional[str] = None,
+    month: Annotated[Optional[str], Query(pattern=MONTH_PATTERN)] = None,
+    department: Optional[str] = None,
+    limit: int = Query(10, ge=1, le=50),
+    date_from: Optional[DateStr] = None,
+    date_to: Optional[DateStr] = None,
+    status: Optional[Status] = None,
+    from_: Annotated[Optional[DateStr], Query(alias="from")] = None,
+    to: Optional[DateStr] = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+):
+    if endpoint == "attendance_list":
+        collection = "attendance_logs"
+        command = {
+            "find": collection,
+            "filter": attendance_list_query(emp_code, date_from, date_to, status),
+            "sort": dict(ATTENDANCE_SORT),
+            "skip": (page - 1) * page_size,
+            "limit": page_size,
+        }
+    else:
+        if endpoint == "employee_monthly":
+            collection = "attendance_logs"
+            pipeline = employee_monthly_pipeline(require("emp_code", emp_code), require("month", month))
+        elif endpoint == "department_summary":
+            collection = "employees"
+            pipeline = department_summary_pipeline(require("month", month), department)
+        elif endpoint == "late_leaderboard":
+            collection = "attendance_logs"
+            pipeline = late_leaderboard_pipeline(require("month", month), limit, department)
+        else:  # department_trend
+            collection = "attendance_logs"
+            start, end = trend_range(require("from", from_), require("to", to))
+            pipeline = department_trend_pipeline(department_employees(require("department", department)), start, end)
+        command = {"aggregate": collection, "pipeline": pipeline, "cursor": {}}
+
+    result = db.command("explain", command, verbosity="executionStats")
+    return {"endpoint": endpoint, "collection": collection, "explain": json.loads(json_util.dumps(result))}
