@@ -167,6 +167,7 @@ DateStr = Annotated[str, AfterValidator(check_date)]
 EpochMillis = Annotated[int, Field(strict=True, ge=100_000_000_000, le=4_102_444_800_000)]
 PresenceStatus = Literal["PRESENT" , "WFH", "ON_DUTY"]
 Status = Literal["PRESENT", "WFH", "ON_DUTY", "ABSENT", "LEAVE"]
+PRESENCE_STATUSES = {"PRESENT", "WFH", "ON_DUTY"}   # R6
 
 class EmployeeIn(BaseModel):
     emp_code: str = Field(pattern=r"^EMP\d{4,6}$")
@@ -192,6 +193,13 @@ class PunchInIn(BaseModel):
 class PunchOutIn(BaseModel):
     emp_code: str
     punched_at: Optional[EpochMillis] = None
+
+class RegularizeIn(BaseModel):
+    status: Optional[Status] = None
+    punch_in: Optional[EpochMillis] = None
+    punch_out: Optional[EpochMillis] = None
+    reason: str = Field(min_length=5, max_length=200)
+    regularized_by: str = Field(min_length=1, max_length=50)
 
 # --------------------------------------------------------------------------- #
 # Endpoints provided
@@ -296,6 +304,68 @@ def punch_out(body: PunchOutIn):
     )
     if updated is None:
         raise HTTPException(409, "already punched out")
+    return record_out(updated)
+
+@app.patch("/attendance/{emp_code}/{date}")
+def regularize(emp_code: str, date: DateStr, body: RegularizeIn):
+    emp = db.employees.find_one({"emp_code": emp_code})
+    if emp is None:
+        raise HTTPException(404, "employee not found")
+    record = db.attendance_logs.find_one({"emp_code": emp_code, "date": date})
+    if record is None:
+        raise HTTPException(404, "no record for that date")
+
+    status = body.status or record["status"]
+    if status in PRESENCE_STATUSES:
+        punch_in = ms_to_dt(body.punch_in) if body.punch_in is not None else record.get("punch_in")
+        punch_out = ms_to_dt(body.punch_out) if body.punch_out is not None else record.get("punch_out")
+        if punch_in is None:
+            raise_422(("body", "punch_in"), "a presence status requires punch_in")
+        if body.punch_in is not None and shift_start_for(punch_in, emp).date().isoformat() != date:
+            raise_422(("body", "punch_in"), "punch_in must stay on the record's attendance date")
+        if punch_out is not None:
+            worked = (punch_out - punch_in).total_seconds()
+            if worked <= 0 or worked > 24 * 3600:
+                raise_422(("body", "punch_out"), "punch_out must be after punch_in and within 24 hours")
+    else:
+        if body.punch_in is not None or body.punch_out is not None:
+            raise_422(("body", "status"), f"{status} cannot have punch times")
+        punch_in = punch_out = None
+
+    new = {"status": status, "punch_in": punch_in, "punch_out": punch_out,
+           "work_hours": None, "late_minutes": 0, "overtime_minutes": 0, "half_day": False}
+    if punch_in is not None:
+        new["late_minutes"] = compute_late_minutes(punch_in, shift_start_for(punch_in, emp))
+    if punch_in is not None and punch_out is not None:
+        new["work_hours"] = compute_work_hours(punch_in, punch_out)
+        new["overtime_minutes"] = compute_overtime(punch_out, shift_end_for(date, emp))
+        new["half_day"] = new["work_hours"] < HALF_DAY_HOURS
+
+    defaults = {"punch_in": None, "punch_out": None, "work_hours": None,
+                "late_minutes": 0, "overtime_minutes": 0, "half_day": False}
+    changes = {}
+    for field, to in new.items():
+        before = record.get(field, defaults.get(field))
+        if before != to:
+            changes[field] = {"from": before, "to": to}
+    if not changes:
+        raise_422(("body",), "the request changes nothing")
+
+    entry = {"at": now_utc(), "by": body.regularized_by, "reason": body.reason, "changes": changes}
+    history_len = len(record.get("history") or [])
+    updated = db.attendance_logs.find_one_and_update(
+        {
+            "_id": record["_id"],
+            "status": record["status"],
+            "punch_in": record.get("punch_in"),
+            "punch_out": record.get("punch_out"),
+            "$expr": {"$eq": [{"$size": {"$ifNull": ["$history", []]}}, history_len]},
+        },
+        {"$set": new, "$push": {"history": entry}},
+        return_document=ReturnDocument.AFTER,
+    )
+    if updated is None:
+        raise HTTPException(409, "record was changed by another request; retry")
     return record_out(updated)
 
 @app.get("/attendance")
