@@ -10,6 +10,7 @@ openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 """
 import os
 import re
+import calendar
 from contextlib import asynccontextmanager
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
@@ -144,6 +145,21 @@ def record_out(doc: dict) -> dict:
         "history": [history_out(h) for h in (doc.get("history") or [])],
     }
 
+def round_half_up(value, places: int = 2) -> float:
+    q = Decimal(1).scaleb(-places)           
+    return float(Decimal(str(value)).quantize(q, rounding=ROUND_HALF_UP))
+
+
+def month_bounds(month: str) -> tuple[date, date]:
+    y, m = map(int, month.split("-"))
+    return date(y, m, 1), date(y, m, calendar.monthrange(y, m)[1])
+
+
+def count_working_days(start: date, end: date) -> int:
+    if start > end:
+        return 0
+    return sum(1 for i in range((end - start).days + 1) if (start + timedelta(days=i)).weekday() < 5)
+
 # --------------------------------------------------------------------------- #
 # Models
 # --------------------------------------------------------------------------- #
@@ -167,7 +183,33 @@ DateStr = Annotated[str, AfterValidator(check_date)]
 EpochMillis = Annotated[int, Field(strict=True, ge=100_000_000_000, le=4_102_444_800_000)]
 PresenceStatus = Literal["PRESENT" , "WFH", "ON_DUTY"]
 Status = Literal["PRESENT", "WFH", "ON_DUTY", "ABSENT", "LEAVE"]
-PRESENCE_STATUSES = {"PRESENT", "WFH", "ON_DUTY"}   # R6
+PRESENCE_STATUSES = {"PRESENT", "WFH", "ON_DUTY"}
+MONTH_PATTERN = r"^\d{4}-(0[1-9]|1[0-2])$"
+
+def employee_monthly_pipeline(emp_code: str, month: str) -> list:
+    first, last = month_bounds(month)
+    return [
+        {"$match": {"emp_code": emp_code, "date": {"$gte": first.isoformat(), "$lte": last.isoformat()}}},
+        {"$addFields": {
+            # $dayOfWeek: 1 = Sunday ... 7 = Saturday, so 2-6 are Mon-Fri.
+            "is_weekday": {"$in": [{"$dayOfWeek": {"$dateFromString": {"dateString": "$date"}}}, [2, 3, 4, 5, 6]]},
+            "is_present": {"$in": ["$status", sorted(PRESENCE_STATUSES)]},
+            "late": {"$ifNull": ["$late_minutes", 0]},
+        }},
+        {"$group": {
+            "_id": None,
+            "present_days": {"$sum": {"$cond": [
+                {"$and": ["$is_weekday", "$is_present"]},
+                {"$cond": [{"$ifNull": ["$half_day", False]}, 0.5, 1]},
+                0,
+            ]}},
+            "leave_days": {"$sum": {"$cond": [{"$eq": ["$status", "LEAVE"]}, 1, 0]}},
+            "late_count": {"$sum": {"$cond": [{"$gt": ["$late", 0]}, 1, 0]}},
+            "total_late_minutes": {"$sum": "$late"},
+            "total_overtime_minutes": {"$sum": {"$ifNull": ["$overtime_minutes", 0]}},
+        }},
+    ]
+
 
 class EmployeeIn(BaseModel):
     emp_code: str = Field(pattern=r"^EMP\d{4,6}$")
@@ -400,6 +442,33 @@ def list_attendance(
         .limit(page_size)
     )
     return {"items": [record_out(d) for d in cursor], "total": total, "page": page, "page_size": page_size}
+
+@app.get("/analytics/employees/{emp_code}/monthly")
+def employee_monthly(emp_code: str, month: str = Query(pattern=MONTH_PATTERN)):
+    emp = db.employees.find_one({"emp_code": emp_code})
+    if emp is None:
+        raise HTTPException(404, "employee not found")
+
+    rows = list(db.attendance_logs.aggregate(employee_monthly_pipeline(emp_code, month)))
+    totals = rows[0] if rows else {}
+
+    first, last = month_bounds(month)
+    working_days = count_working_days(max(first, date.fromisoformat(emp["joined_on"])), last)
+    present_days = totals.get("present_days", 0)
+    attendance_pct = (
+        round_half_up(Decimal(str(present_days)) * 100 / working_days) if working_days else None
+    )
+    return {
+        "emp_code": emp_code,
+        "month": month,
+        "working_days": working_days,
+        "present_days": present_days,
+        "leave_days": totals.get("leave_days", 0),
+        "late_count": totals.get("late_count", 0),
+        "total_late_minutes": totals.get("total_late_minutes", 0),
+        "total_overtime_minutes": totals.get("total_overtime_minutes", 0),
+        "attendance_pct": attendance_pct,
+    }
 
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
