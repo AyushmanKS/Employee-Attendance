@@ -258,6 +258,27 @@ def department_summary_pipeline(month: str, department: Optional[str] = None) ->
         {"$sort": {"department": 1}},
     ]
 
+def late_leaderboard_pipeline(month: str, limit: int = 10, department: Optional[str] = None) -> list:
+    first, last = month_bounds(month)
+    pipeline = [
+        {"$match": {"date": {"$gte": first.isoformat(), "$lte": last.isoformat()}, "late_minutes": {"$gt": 0}}},
+        {"$group": {"_id": "$emp_code", "total_late_minutes": {"$sum": "$late_minutes"}, "late_count": {"$sum": 1}}},
+        {"$lookup": {"from": "employees", "localField": "_id", "foreignField": "emp_code", "as": "emp"}},
+        {"$unwind": "$emp"},          
+    ]
+    if department is not None:
+        pipeline.append({"$match": {"emp.department": department}})  
+    pipeline += [
+        {"$setWindowFields": {"sortBy": {"total_late_minutes": -1}, "output": {"rank": {"$rank": {}}}}},
+        {"$match": {"rank": {"$lte": limit}}},                      
+        {"$sort": {"total_late_minutes": -1, "_id": 1}},
+        {"$project": {
+            "_id": 0, "rank": 1, "emp_code": "$_id", "name": "$emp.name",
+            "department": "$emp.department", "total_late_minutes": 1, "late_count": 1,
+        }},
+    ]
+    return pipeline
+
 class EmployeeIn(BaseModel):
     emp_code: str = Field(pattern=r"^EMP\d{4,6}$")
     name: str = Field(min_length=1, max_length=100)
@@ -523,6 +544,15 @@ def department_summary(month: str = Query(pattern=MONTH_PATTERN), department: Op
     for item in items:
         if item["avg_work_hours"] is not None:
             item["avg_work_hours"] = round_half_up(item["avg_work_hours"])   # R8
+    return {"month": month, "items": items}
+
+@app.get("/analytics/leaderboard/late")
+def late_leaderboard(
+    month: str = Query(pattern=MONTH_PATTERN),
+    limit: int = Query(10, ge=1, le=50),
+    department: Optional[str] = None,
+):
+    items = list(db.attendance_logs.aggregate(late_leaderboard_pipeline(month, limit, department)))
     return {"month": month, "items": items}
 
 # --------------------------------------------------------------------------- #
