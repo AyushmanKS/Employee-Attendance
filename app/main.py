@@ -186,6 +186,12 @@ PresenceStatus = Literal["PRESENT" , "WFH", "ON_DUTY"]
 Status = Literal["PRESENT", "WFH", "ON_DUTY", "ABSENT", "LEAVE"]
 PRESENCE_STATUSES = {"PRESENT", "WFH", "ON_DUTY"}
 MONTH_PATTERN = r"^\d{4}-(0[1-9]|1[0-2])$"
+TREND_MAX_DAYS = 92
+
+def half_up_expr(expr, places: int) -> dict:
+    f = 10 ** places
+    return {"$divide": [{"$floor": {"$add": [{"$round": [{"$multiply": [expr, f]}, 9]}, 0.5]}}, f]}
+
 
 def weekday_expr(date_field: str) -> dict:
     return {"$in": [{"$dayOfWeek": {"$dateFromString": {"dateString": date_field}}}, [2, 3, 4, 5, 6]]}
@@ -278,6 +284,52 @@ def late_leaderboard_pipeline(month: str, limit: int = 10, department: Optional[
         }},
     ]
     return pipeline
+
+def department_trend_pipeline(emps: list, start: date, end: date) -> list:
+    s, e = start.isoformat(), end.isoformat()
+    codes = [x["emp_code"] for x in emps]
+    joined = [x["joined_on"] for x in emps]
+    return [
+        {"$match": {"emp_code": {"$in": codes}, "date": {"$gte": s, "$lte": e}}},
+        {"$group": {
+            "_id": "$date",
+            "present_count": {"$sum": {"$cond": [
+                {"$in": ["$status", sorted(PRESENCE_STATUSES)]},
+                {"$cond": [{"$ifNull": ["$half_day", False]}, 0.5, 1]},
+                0,
+            ]}},
+            "late_count": {"$sum": {"$cond": [{"$gt": [{"$ifNull": ["$late_minutes", 0]}, 0]}, 1, 0]}},
+        }},
+        {"$unionWith": {"pipeline": [{"$documents": [
+            {"_id": s, "present_count": 0, "late_count": 0},
+            {"_id": e, "present_count": 0, "late_count": 0},
+        ]}]}},
+        {"$group": {"_id": "$_id", "present_count": {"$sum": "$present_count"}, "late_count": {"$sum": "$late_count"}}},
+        {"$addFields": {"day": {"$dateFromString": {"dateString": "$_id"}}}},
+        {"$densify": {"field": "day", "range": {"step": 1, "unit": "day", "bounds": "full"}}},
+        {"$addFields": {
+            "date": {"$dateToString": {"date": "$day", "format": "%Y-%m-%d"}},
+            "present_count": {"$ifNull": ["$present_count", 0]},
+            "late_count": {"$ifNull": ["$late_count", 0]},
+        }},
+        {"$addFields": {
+            "is_working_day": weekday_expr("$date"),
+            "headcount": {"$size": {"$filter": {"input": joined, "cond": {"$lte": ["$$this", "$date"]}}}},
+        }},
+        {"$addFields": {"attendance_rate": {"$cond": [
+            {"$and": ["$is_working_day", {"$gt": ["$headcount", 0]}]},
+            half_up_expr({"$divide": ["$present_count", "$headcount"]}, 4),
+            None,
+        ]}}},
+        {"$setWindowFields": {"sortBy": {"day": 1}, "output": {
+            "moving_avg_7d": {"$avg": "$attendance_rate", "window": {"documents": [-6, 0]}},
+        }}},
+        {"$project": {
+            "_id": 0, "date": 1, "is_working_day": 1, "headcount": 1, "present_count": 1,
+            "late_count": 1, "attendance_rate": 1, "moving_avg_7d": half_up_expr("$moving_avg_7d", 4),
+        }},
+        {"$sort": {"date": 1}},
+    ]
 
 class EmployeeIn(BaseModel):
     emp_code: str = Field(pattern=r"^EMP\d{4,6}$")
@@ -554,6 +606,20 @@ def late_leaderboard(
 ):
     items = list(db.attendance_logs.aggregate(late_leaderboard_pipeline(month, limit, department)))
     return {"month": month, "items": items}
+
+@app.get("/analytics/departments/{department}/trend")
+def department_trend(department: str, from_: Annotated[DateStr, Query(alias="from")], to: DateStr):
+    if to < from_:
+        raise_422(("query", "to"), "to must be on or after from")
+    start, end = date.fromisoformat(from_), date.fromisoformat(to)
+    if (end - start).days + 1 > TREND_MAX_DAYS:
+        raise_422(("query", "to"), f"range exceeds {TREND_MAX_DAYS} days")
+
+    emps = list(db.employees.find({"department": department}, {"_id": 0, "emp_code": 1, "joined_on": 1}))
+    if not emps:
+        raise HTTPException(404, "unknown department")
+    items = list(db.attendance_logs.aggregate(department_trend_pipeline(emps, start, end)))
+    return {"department": department, "items": items}
 
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
