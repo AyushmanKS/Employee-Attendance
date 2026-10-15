@@ -46,6 +46,7 @@ def create_indexes():
     db.employees.create_index([("department", 1), ("emp_code", 1)])
     db.attendance_logs.create_index([("date", -1), ("emp_code", 1)])
     db.attendance_logs.create_index([("emp_code", 1), ("punch_in", -1)])
+    db.employees.create_index("joined_on")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -186,13 +187,16 @@ Status = Literal["PRESENT", "WFH", "ON_DUTY", "ABSENT", "LEAVE"]
 PRESENCE_STATUSES = {"PRESENT", "WFH", "ON_DUTY"}
 MONTH_PATTERN = r"^\d{4}-(0[1-9]|1[0-2])$"
 
+def weekday_expr(date_field: str) -> dict:
+    return {"$in": [{"$dayOfWeek": {"$dateFromString": {"dateString": date_field}}}, [2, 3, 4, 5, 6]]}
+
+
 def employee_monthly_pipeline(emp_code: str, month: str) -> list:
     first, last = month_bounds(month)
     return [
         {"$match": {"emp_code": emp_code, "date": {"$gte": first.isoformat(), "$lte": last.isoformat()}}},
         {"$addFields": {
-            # $dayOfWeek: 1 = Sunday ... 7 = Saturday, so 2-6 are Mon-Fri.
-            "is_weekday": {"$in": [{"$dayOfWeek": {"$dateFromString": {"dateString": "$date"}}}, [2, 3, 4, 5, 6]]},
+            "is_weekday": weekday_expr("$date"),
             "is_present": {"$in": ["$status", sorted(PRESENCE_STATUSES)]},
             "late": {"$ifNull": ["$late_minutes", 0]},
         }},
@@ -210,6 +214,49 @@ def employee_monthly_pipeline(emp_code: str, month: str) -> list:
         }},
     ]
 
+def department_summary_pipeline(month: str, department: Optional[str] = None) -> list:
+    first, last = month_bounds(month)
+    match = {"joined_on": {"$lte": last.isoformat()}}          
+    if department is not None:
+        match["department"] = department
+    return [
+        {"$match": match},
+        {"$lookup": {
+            "from": "attendance_logs",
+            "localField": "emp_code",
+            "foreignField": "emp_code",
+            "pipeline": [{"$match": {"date": {"$gte": first.isoformat(), "$lte": last.isoformat()}}}],
+            "as": "logs",
+        }},
+        {"$unwind": {"path": "$logs", "preserveNullAndEmptyArrays": True}},
+        {"$addFields": {
+            "is_present": {"$in": ["$logs.status", sorted(PRESENCE_STATUSES)]},
+            "is_weekday": weekday_expr("$logs.date"),
+            "late": {"$ifNull": ["$logs.late_minutes", 0]},
+        }},
+        {"$group": {
+            "_id": "$department",
+            "employees": {"$addToSet": "$emp_code"},
+            "present_days": {"$sum": {"$cond": [
+                {"$and": ["$is_weekday", "$is_present"]},
+                {"$cond": [{"$ifNull": ["$logs.half_day", False]}, 0.5, 1]},
+                0,
+            ]}},
+            "avg_work_hours": {"$avg": {"$cond": ["$is_present", "$logs.work_hours", None]}},
+            "late_count": {"$sum": {"$cond": [{"$gt": ["$late", 0]}, 1, 0]}},
+            "total_late_minutes": {"$sum": "$late"},
+            "leave_count": {"$sum": {"$cond": [{"$eq": ["$logs.status", "LEAVE"]}, 1, 0]}},
+            "on_duty_count": {"$sum": {"$cond": [{"$eq": ["$logs.status", "ON_DUTY"]}, 1, 0]}},
+        }},
+        {"$project": {
+            "_id": 0,
+            "department": "$_id",
+            "headcount": {"$size": "$employees"},
+            "present_days": 1, "avg_work_hours": 1, "late_count": 1,
+            "total_late_minutes": 1, "leave_count": 1, "on_duty_count": 1,
+        }},
+        {"$sort": {"department": 1}},
+    ]
 
 class EmployeeIn(BaseModel):
     emp_code: str = Field(pattern=r"^EMP\d{4,6}$")
@@ -469,6 +516,14 @@ def employee_monthly(emp_code: str, month: str = Query(pattern=MONTH_PATTERN)):
         "total_overtime_minutes": totals.get("total_overtime_minutes", 0),
         "attendance_pct": attendance_pct,
     }
+
+@app.get("/analytics/departments/summary")
+def department_summary(month: str = Query(pattern=MONTH_PATTERN), department: Optional[str] = None):
+    items = list(db.employees.aggregate(department_summary_pipeline(month, department)))
+    for item in items:
+        if item["avg_work_hours"] is not None:
+            item["avg_work_hours"] = round_half_up(item["avg_work_hours"])   # R8
+    return {"month": month, "items": items}
 
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
